@@ -5,17 +5,36 @@ import java.util.List;
 import java.util.function.Consumer;
 import static lexscope.Ast.*;
 
-/** Existing AST evaluator. Resolution currently happens during execution. */
+/** AST evaluator. Resolution happens fully before any execution or output. */
 public final class Engine {
+    private Resolution resolution;
     private Consumer<Long> output;
 
     public void execute(List<Stmt> program, Consumer<Long> output) {
+        Resolution resolved = Resolver.resolve(program);
+        this.resolution = resolved;
         this.output = output;
         try {
-            statements(program, new Environment(null));
+            Environment global = new Environment(null);
+            enterScope(resolved.scopeOf(program), global, List.of());
+            statements(program, global);
         } catch (ReturnSignal signal) {
             throw new LangException("RESOLVE", "Return outside a function");
+        } finally {
+            this.resolution = null;
+            this.output = null;
         }
+    }
+
+    Resolution resolution() { return resolution; }
+
+    void enterScope(ScopeInfo info, Environment env, List<Object> arguments) {
+        for (int i = 0; i < info.params.size(); i++)
+            env.cells.put(info.params.get(i), Cell.initialized(arguments.get(i)));
+        for (var entry : info.functions)
+            env.cells.put(entry.getKey(), Cell.initialized(new FunctionValue(entry.getValue(), env)));
+        for (Slot slot : info.lets)
+            env.cells.put(slot, new Cell());
     }
 
     void statements(List<Stmt> body, Environment env) {
@@ -24,13 +43,20 @@ public final class Engine {
 
     private void statement(Stmt statement, Environment env) {
         if (statement instanceof Let s) {
-            env.define(s.name(), expression(s.initializer(), env));
+            Object value = expression(s.initializer(), env);
+            cell(env, resolution.slotOf(s)).initialize(value);
         } else if (statement instanceof Assign s) {
-            env.assign(s.name(), expression(s.value(), env));
-        } else if (statement instanceof Fun s) {
-            env.define(s.name(), new FunctionValue(s, env));
+            Object value = expression(s.value(), env);
+            Cell target = cell(env, resolution.slotOf(s));
+            if (!target.isInitialized())
+                throw new LangException("UNINITIALIZED", "Assignment before initialization: " + s.name());
+            target.initialize(value);
+        } else if (statement instanceof Fun) {
+            // Function cells are initialized on scope entry; nothing to do here.
         } else if (statement instanceof Block s) {
-            statements(s.body(), new Environment(env));
+            Environment child = new Environment(env);
+            enterScope(resolution.scopeOf(s), child, List.of());
+            statements(s.body(), child);
         } else if (statement instanceof If s) {
             statement(number(expression(s.condition(), env)) != 0 ? s.yes() : s.no(), env);
         } else if (statement instanceof Return s) {
@@ -44,7 +70,12 @@ public final class Engine {
 
     private Object expression(Expr expression, Environment env) {
         if (expression instanceof Num e) return e.value();
-        if (expression instanceof Var e) return env.get(e.name());
+        if (expression instanceof Var e) {
+            Cell source = cell(env, resolution.slotOf(e));
+            if (!source.isInitialized())
+                throw new LangException("UNINITIALIZED", "Read before initialization: " + e.name());
+            return source.value();
+        }
         if (expression instanceof Binary e) {
             long a = number(expression(e.left(), env));
             long b = number(expression(e.right(), env));
@@ -61,9 +92,17 @@ public final class Engine {
             for (Expr arg : e.args()) arguments.add(expression(arg, env));
             if (!(callable instanceof FunctionValue function))
                 throw new LangException("TYPE", "Not callable");
-            return function.call(this, arguments, env);
+            return function.call(this, arguments);
         }
         throw new IllegalArgumentException("Unknown expression");
+    }
+
+    private static Cell cell(Environment env, Slot slot) {
+        for (Environment current = env; current != null; current = current.parent) {
+            Cell found = current.cells.get(slot);
+            if (found != null) return found;
+        }
+        throw new IllegalStateException("Resolved slot has no runtime cell");
     }
 
     private static long number(Object value) {

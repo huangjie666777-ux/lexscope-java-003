@@ -92,6 +92,20 @@ with public main methods using assertions or explicit checks; test.sh discovers 
 Tests, Demo.java and README may be added/updated. Build scripts may be adjusted
 only as necessary for the same two documented offline commands.
 
+## Implementation notes
+
+Execution is split into two phases. `Resolver` first walks the whole AST and
+statically binds every `Var`/`Assign`/`Let` occurrence to a unique `Slot`
+(identity-keyed, so structurally equal nodes never share bindings), reporting
+RESOLVE errors before any evaluation or output. For each program/block/function
+scope it records a `ScopeInfo`: parameter, function and let slots. `Engine`
+then runs the tree; entering a scope allocates fresh `Cell`s in a new
+`Environment` frame, initializing function cells immediately (hoisting,
+recursion, mutual recursion) and leaving let cells uninitialized until their
+Let statement stores a value (UNINITIALIZED on early read/write, never falling
+back to an outer binding). `FunctionValue` closes over its definition
+environment, so captured cells stay mutable and shared per defining call.
+
 ```sh
 bash test.sh
 bash demo.sh
