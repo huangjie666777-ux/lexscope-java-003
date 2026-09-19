@@ -1,111 +1,101 @@
-# httpframe
+# lexscope
 
-An existing, dependency-free decoder for captured HTTP request bytes. It is an
-offline parser, not an HTTP server. The modules currently handle common ASCII
-examples, but incremental framing, validation and failure state need repair.
-The rules below are the target contract; passing the compatibility tests alone
-does not establish correctness. Node.js 22.14.0 is already available.
+Existing Java 17 AST interpreter with separate syntax, environment, functions,
+execution and error modules. It currently supports straightforward examples but
+has defects in binding, function creation and closure lifetime. This project is
+host-embedded: the host constructs immutable Ast records; no text parser or CLI
+is needed. The following is the target contract, not a claim that it already works.
 
-## Public API
+## Host API and inputs
 
-Import `RequestDecoder` and `ParseError` from `src/index.js` (ES modules).
-`new RequestDecoder({maxHeaderBytes=8192, maxBodyBytes=1048576}={})` accepts valid
-integer options: maxHeaderBytes >= 1 and maxBodyBytes >= 0. No option validation
-is required. `push(buffer)` receives only Node Buffers and synchronously returns
-an array of all newly completed messages. Empty Buffers are valid. No callbacks,
-streams or sockets are required. `end()` reports EOF and returns an empty array
-if currently at a request boundary, including a completely empty stream.
+`new Engine().execute(List<Ast.Stmt> program, Consumer<Long> output)` executes an
+independent program. A host callback consumes emitted integer values. Callback
+exceptions propagate unchanged. Do not catch them as language control flow.
+The host reuses Engine and AST objects between sequential runs. Each run starts
+with fresh runtime bindings and fresh resolution state; a failed run must not
+pollute a later run. No concurrent/reentrant execute or rollback of emitted output
+is required. Do not modify the supplied records or lists.
 
-Each message has exactly these fields:
+Inputs are well-formed finite trees: nonnull fields, valid nonempty identifiers,
+known operators, and each node object occurs in only one position in a given
+tree. Distinct record objects may be structurally equal and must still resolve
+according to their separate occurrences. No validation of those input premises
+is required. Empty lists/blocks/parameter lists are valid.
 
-```js
-{
-  method: 'POST', target: '/upload', version: 'HTTP/1.1',
-  headers: [['host', 'local'], ['content-length', '2']],
-  body: Buffer.from([0, 255]), trailers: []
-}
-```
+## Scope and resolution (before execution)
 
-Fields are ordered `[lowercaseName, trimmedValue]` pairs; repeated ordinary
-fields remain separate and in wire order. Trim only ASCII SP and HTAB around
-values. Do not merge trailers into headers. Bodies contain the decoded payload
-bytes, not chunk framing. Input buffers may be reused/mutated by the caller after
-push returns; accepted bytes and returned bodies must remain unchanged. Returned
-body buffers must not alias input buffers. No object-freezing requirement.
+A program is one scope. Each explicit Block creates a child scope. Each function
+call creates a child scope of that function's DEFINITION environment. Parameters
+and the function body's direct declarations share one scope (no extra body scope).
+The Block branches of If are ordinary explicit scopes.
 
-## Exact supported wire subset
+All direct Let and Fun names in a scope are declared throughout that whole scope,
+including before their textual declaration. Resolve all Var and Assign targets
+to the nearest enclosing declaration. A later local declaration shadows an outer
+name even at earlier source positions. Declarations in descendant blocks do not
+leak into a parent or sibling. Function bodies are resolved in their definition
+context, not in caller scopes.
 
-- Request line: `METHOD SP TARGET SP HTTP/1.1 CRLF`, exactly one ASCII space at
-  each separator. METHOD is a nonempty HTTP token. TARGET starts with `/` and
-  otherwise consists of visible ASCII bytes 0x21..0x7e excluding `#`. No URL
-  decoding, absolute-form, HTTP/1.0, response parsing, upgrade or CONNECT handling.
-- Token characters: ASCII letters, digits and `!#$%&'*+-.^_` followed by the
-  backtick character, vertical bar and tilde. This same set defines field names.
-- All request/header/trailer/chunk-size line endings are CRLF. Reject bare LF,
-  CR followed by a non-LF byte, leading blank lines, obsolete folding, empty field
-  names, and whitespace before a field colon. A final CR split across pushes is
-  incomplete until the next byte or EOF. A field value contains only HTAB or
-  ASCII 0x20..0x7e (no other controls, DEL or non-ASCII bytes).
-- Exactly one Host field with a nonempty trimmed value is required. No host-name
-  or port grammar validation. Other ordinary fields, including empty values,
-  are allowed and preserved; duplicate ordinary fields are allowed.
-- Content-Length (CL) and Transfer-Encoding (TE) names are case-insensitive.
-  CL+TE together, two CL fields, or two TE fields are always `AMBIGUOUS`, even
-  if duplicate values agree. A single CL value after SP/HTAB trimming is one or
-  more decimal digits (leading zeros allowed); no sign, commas, hex or suffix.
-  A syntactically valid length exceeding maxBodyBytes is `LIMIT`, with no body
-  needed. Avoid overflow/precision loss for arbitrarily many digits.
-- TE supports exactly one case-insensitive `chunked` value after trimming. Other
-  values, lists, parameters and coding sequences are `SYNTAX`. Without CL/TE the
-  request has zero body bytes regardless of method; following bytes start the
-  next request. Do not infer length from EOF or method.
-- A chunk size is one or more hexadecimal digits followed immediately by CRLF.
-  No spaces, signs, `0x`, or chunk extensions in this deliberately strict subset.
-  Leading zeros and upper/lowercase hex are valid. Nonzero sizes are followed by
-  exactly that many uninterpreted bytes and CRLF. A zero chunk is followed directly
-  by the trailer section, ending in an empty CRLF line. Empty trailers are thus
-  `0\r\n\r\n`. Trailer field grammar matches header field grammar, but Host, CL
-  and TE are forbidden (`SYNTAX`). A Trailer declaration header is not required.
+Before ANY evaluation or output, validate the entire AST, including unchosen If
+branches and uncalled function bodies. Undefined Var/Assign names, duplicate
+Let/Fun/parameter names in the same scope, and Return outside any function throw
+`new LangException("RESOLVE", message)`. Shadowing in a nested Block is legal.
+No diagnostic wording or ordering among multiple static errors is specified.
 
-## Limits and terminal errors
+## Binding lifecycle and functions
 
-- maxHeaderBytes applies independently to (a) the whole request line and header
-  section including its final CRLFCRLF, (b) EACH chunk-size line including CRLF,
-  and (c) the entire trailer section including its final empty CRLF. Equality is
-  allowed. Empty trailers count as 2 bytes; `0\r\n` belongs to the size line, not
-  trailers. Data chunks and subsequent requests do not count toward header limits.
-- maxBodyBytes applies to the total decoded body of ONE request, not buffered
-  input or a whole pipeline. Equality is allowed. For chunked data, reject as soon
-  as a complete size line advertises more than the remaining body allowance.
-- Reject a line/section once its already-received byte count exceeds its limit,
-  even without a terminator. Do not wait for EOF or additional input once malformed
-  syntax or a size violation is decidable. Do not assign a required precedence
-  when the same input simultaneously violates different rules.
-- Throw `ParseError` with `code` in `SYNTAX`, `AMBIGUOUS`, `LIMIT`, `TRUNCATED`,
-  or `CLOSED`; error message wording is not fixed. On a failure during push,
-  `.completed` contains the full messages completed earlier IN THAT PUSH only,
-  in order; messages returned by prior successful pushes are not repeated.
-  Never return the invalid or incomplete message. After any ParseError, all
-  subsequent push/end calls throw the same exception object, retaining its
-  original completed array. No resynchronization after malformed input.
-- EOF inside a request line, fields, fixed body, chunk-size/data/CRLF or trailers
-  yields TRUNCATED. Normal EOF closes the decoder; repeated end returns `[]`.
-  A push after normal EOF throws CLOSED and makes that error sticky as above.
+On entering a scope, allocate fresh cells for all its direct declarations.
+Initialize function cells immediately, before executing any statements, so calls
+before Fun statements, self-recursion and mutual recursion work. A Fun statement
+has no second initialization effect. Function bindings are mutable just like Let
+bindings and can be read, passed, returned or assigned.
 
-This is a specified parsing subset inspired by HTTP/1.1; it intentionally rejects
-some forms a general HTTP implementation might support. The task contract above
-takes precedence; do not silently relax it to match another parser.
+Let cells remain UNINITIALIZED until that Let statement evaluates its initializer
+successfully and then stores the result. This includes self-reference in an
+initializer, reads from a function called too early, and assignment before the Let
+statement. Accessing or assigning an uninitialized cell throws
+`LangException("UNINITIALIZED", ...)`; never fall back to an outer binding.
+Do not reject a reference merely because the declaration is later: an uncalled
+function can refer to a later Let and be called successfully after it initializes.
+For Assign, evaluate its RHS first, then check/write the target cell.
 
-## Development
+Functions capture CELLS in their definition environment, not snapshots of values.
+An escaped closure stays usable after the defining call/block returns. Closures
+created in one call share captured cells; different outer calls get independent
+cells. Return unwinds all nested Block/If execution up to the current function
+only. A function falling off its end returns integer zero. Parameters are initialized
+from arguments when the function is entered.
 
-`src/decoder.js` coordinates framing, `src/headers.js` reads fields and chooses
-body framing, `src/chunks.js` decodes chunks, and `src/errors.js` defines errors.
-You may reorganize internals inside src while retaining the public API. Keep
-`tests/compat.test.js` unchanged; add focused regression tests and a `demo.js`.
-Use only built-in Node modules; do not delegate parsing to `node:http` or a native
-HTTP parser. No network, package installation or running server is needed.
+## Values and evaluation order
+
+Values are signed Java long integers or opaque function values. Num constructs an
+integer. Binary evaluates left first and checks it is an integer, then evaluates
+and checks right; ADD/SUB/MUL use normal Java long wraparound, LE returns 1 or 0.
+If checks an integer condition; zero is false and any other integer true. Emit
+checks an integer and passes it to the host callback; Eval discards any value.
+
+Call evaluates callee, then ALL arguments left-to-right, then checks that the
+callee is a function (`TYPE` if not) and the argument count (`ARITY` if wrong).
+Arguments are evaluated even when the call subsequently fails TYPE/ARITY.
+Using a function where an integer is required throws TYPE. Runtime language
+exceptions use LangException; `.code()` returns RESOLVE, UNINITIALIZED, TYPE or
+ARITY. No static type checking, stack-limit handling or tail-call optimization.
+
+## Example and development
+
+Ast records are in `src/main/java/lexscope/Ast.java`. Engine coordinates execution,
+Environment stores bindings, FunctionValue represents functions and ReturnSignal
+implements current function exit. Internals may be reorganized inside this package;
+preserve the public host interfaces, AST constructors and exception constructor.
+Keep `tests/CompatTest.java` unchanged. Add `*Test.java` executable test classes
+with public main methods using assertions or explicit checks; test.sh discovers them.
+Tests, Demo.java and README may be added/updated. Build scripts may be adjusted
+only as necessary for the same two documented offline commands.
 
 ```sh
-npm test
-node demo.js
+bash test.sh
+bash demo.sh
 ```
+
+No external libraries, network, database or services. The initial Demo only covers
+arithmetic; extend it to the task's closure and initialization examples.
