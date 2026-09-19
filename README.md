@@ -92,6 +92,24 @@ with public main methods using assertions or explicit checks; test.sh discovers 
 Tests, Demo.java and README may be added/updated. Build scripts may be adjusted
 only as necessary for the same two documented offline commands.
 
+## Implementation notes
+
+Execution is split into two phases inside the `lexscope` package:
+
+1. `Resolver` walks the whole AST before anything runs. It builds a static
+   scope tree (program, each Block, each function with its parameters) and
+   binds every Var/Assign/Let node, by object identity so structurally
+   equal nodes at different positions never mix, to a slot in one static
+   scope. Duplicate declarations in one scope, undefined names and Return
+   outside a function are reported here as RESOLVE, before any output.
+2. `Engine` interprets the resolved program. Each scope entry creates an
+   `Environment` activation with one mutable cell per slot; function cells
+   are filled immediately, Let cells stay UNINITIALIZED until their
+   statement stores a value. `FunctionValue` closes over its defining
+   activation, so captured cells stay alive and shared after the defining
+   scope exits, and each call creates a fresh child of the definition
+   environment. `execute` keeps no state between runs.
+
 ```sh
 bash test.sh
 bash demo.sh

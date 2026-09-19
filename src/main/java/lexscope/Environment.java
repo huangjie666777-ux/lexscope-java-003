@@ -1,22 +1,56 @@
 package lexscope;
 
-import java.util.HashMap;
-import java.util.Map;
+import java.util.Arrays;
+import java.util.List;
+import static lexscope.Ast.*;
 
-/** Current name-based environment chain. */
+/**
+ * Runtime activation of one static scope. Holds one mutable cell per declared
+ * slot; cells of Let bindings stay UNINITIALIZED until their statement runs.
+ * Closures capture these activations, so captured bindings stay alive and
+ * mutable after the defining scope finishes.
+ */
 final class Environment {
+    private static final Object UNINITIALIZED = new Object();
+
     final Environment parent;
-    final Map<String, Object> values = new HashMap<>();
-    Environment(Environment parent) { this.parent = parent; }
-    void define(String name, Object value) { values.put(name, value); }
-    Object get(String name) {
-        if (values.containsKey(name)) return values.get(name);
-        if (parent != null) return parent.get(name);
-        throw new LangException("RESOLVE", "Unknown name: " + name);
+    final Resolver.Scope scope;
+    final Object[] cells;
+
+    Environment(Environment parent, Resolver.Scope scope) {
+        this.parent = parent;
+        this.scope = scope;
+        this.cells = new Object[scope.size()];
+        Arrays.fill(this.cells, UNINITIALIZED);
+        List<Stmt> declarations = scope.declarations;
+        for (int slot = 0; slot < declarations.size(); slot++) {
+            if (declarations.get(slot) instanceof Fun fun)
+                cells[slot] = new FunctionValue(fun, this);
+        }
     }
-    void assign(String name, Object value) {
-        if (values.containsKey(name)) { values.put(name, value); return; }
-        if (parent != null) { parent.assign(name, value); return; }
-        throw new LangException("RESOLVE", "Unknown assignment: " + name);
+
+    private Environment owner(Resolver.Ref ref) {
+        Environment env = this;
+        while (env.scope != ref.scope) env = env.parent;
+        return env;
+    }
+
+    Object get(Resolver.Ref ref) {
+        Object value = owner(ref).cells[ref.slot];
+        if (value == UNINITIALIZED)
+            throw new LangException("UNINITIALIZED", "Variable read before its Let ran");
+        return value;
+    }
+
+    void assign(Resolver.Ref ref, Object value) {
+        Environment env = owner(ref);
+        if (env.cells[ref.slot] == UNINITIALIZED)
+            throw new LangException("UNINITIALIZED", "Variable assigned before its Let ran");
+        env.cells[ref.slot] = value;
+    }
+
+    /** Stores a Let's initializer result; the cell becomes readable. */
+    void initialize(Resolver.Ref ref, Object value) {
+        owner(ref).cells[ref.slot] = value;
     }
 }
